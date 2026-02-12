@@ -133,14 +133,6 @@ luxembourg-scraper/
 ├── requirements.txt           # Python dependencies
 │
 ├── README.md                  # This file
-├── MONGODB_SETUP.md           # MongoDB Atlas setup guide
-├── DEPLOYMENT.md              # Server deployment guide
-│
-└── images/                    # Downloaded property photos
-    └── <listing_ref>/
-        ├── 1.jpg
-        ├── 2.jpg
-        └── ...
 ```
 
 ---
