@@ -1,5 +1,5 @@
 # immo-snip-lu
-# Luxembourg Real Estate Scraper
+
 
 A production-ready web scraper for Luxembourg real estate listings from **athome.lu** and **immotop.lu**. Automatically discovers new listings, detects price changes, extracts 40+ fields including contact information, and stores everything in MongoDB Atlas or SQLite.
 
