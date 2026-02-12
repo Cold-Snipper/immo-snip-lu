@@ -328,25 +328,18 @@ Or use MongoDB instead (no locking issues).
 
 ### Best Practices
 
-1. **Never commit credentials to Git:**
-   ```bash
-   echo "*.db" >> .gitignore
-   echo ".env" >> .gitignore
-   echo "mongo_scheduler.log" >> .gitignore
-   ```
-
-2. **Use environment variables for MongoDB URI:**
+1. **Use environment variables for MongoDB URI:**
    ```bash
    # Don't hardcode in files!
    export MONGO_URI="mongodb+srv://..."
    ```
 
-3. **Restrict MongoDB access:**
+2. **Restrict MongoDB access:**
    - Use strong passwords (20+ characters)
    - Whitelist specific IPs (not 0.0.0.0/0 in production)
    - Enable 2FA on MongoDB Atlas account
 
-4. **Respect website terms:**
+3. **Respect website terms:**
    - 5-minute intervals (not aggressive)
    - Single-threaded scraping
    - No unnecessary requests
