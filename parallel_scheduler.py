@@ -53,7 +53,7 @@ immotop_scraper.db_stats = mongo_db.db_stats
 # ─────────────────────────────────────────────────────────────
 
 MAX_PAGES_PER_INDEX = 1
-SAVE_IMAGES = True
+SAVE_IMAGES = False
 HEADLESS = True
 DELAY_SECONDS = 0
 
