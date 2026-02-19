@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any, Tuple
 
 from bs4 import BeautifulSoup, Tag
+from phone_validator import clean_phone
 
 # Import shared DB functions from athome_scraper
 # (We'll create a shared db.py module, but for now just duplicate the essentials)
@@ -428,13 +429,17 @@ def scrape_detail(
         data["description"] = _clean(desc_section.get_text("\n"))
     
     # ── Phone from description ───────────────────────────────
+    # Validated with clean_phone() — if garbage, stays None so button click fires.
     if data.get("description"):
         ph = _extract_phone(data["description"])
         if ph:
-            data["phone_number"] = ph
-            data["phone_source"] = "description"
+            ph = clean_phone(ph, hint="LU")
+            if ph:
+                data["phone_number"] = ph
+                data["phone_source"] = "description"
     
     # ── Phone from button click ──────────────────────────────
+    # Only runs if Pass 1 found nothing valid.
     if not data.get("phone_number"):
         # immotop uses "Afficher le téléphone" button
         try:
@@ -449,7 +454,7 @@ def scrape_detail(
             soup = BeautifulSoup(driver.page_source, "lxml")
             for link in soup.find_all("a", href=re.compile(r"^tel:")):
                 raw = link.get("href").replace("tel:","").strip()
-                ph = _extract_phone(raw)
+                ph = clean_phone(raw, hint="LU")
                 if ph:
                     data["phone_number"] = ph
                     data["phone_source"] = "button"
@@ -460,8 +465,10 @@ def scrape_detail(
                 page_text = soup.get_text()
                 ph = _extract_phone(page_text)
                 if ph:
-                    data["phone_number"] = ph
-                    data["phone_source"] = "button"
+                    ph = clean_phone(ph, hint="LU")
+                    if ph:
+                        data["phone_number"] = ph
+                        data["phone_source"] = "button"
         except Exception as e:
             log.debug(f"  Phone button not found or click failed: {e}")
 

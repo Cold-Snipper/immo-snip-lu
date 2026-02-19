@@ -14,3 +14,4 @@ pymongo==4.6.1
 # twilio==8.13.0
 
 # Note: SQLite is part of Python's standard library — no install needed.
+phonenumbers

@@ -18,7 +18,8 @@ Strategy
   • Two pages max per run (configurable). After a few days the DB is complete.
 
 Phone logic (two passes)
-  1. Regex scan of the description text.
+  1. Regex scan of the description text — validated with clean_phone().
+     If invalid/garbage, phone_number stays None so Pass 2 fires.
   2. Selenium click on "Afficher le numéro" / "Show phone number",
      then read the <a href="tel:…"> injected into the DOM.
 
@@ -90,6 +91,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any, Tuple
 
 from bs4 import BeautifulSoup, Tag
+from phone_validator import clean_phone
 
 try:
     from selenium import webdriver
@@ -328,36 +330,19 @@ def _clean(t: Any) -> str:
     return re.sub(r"\s+", " ", str(t or "")).strip()
 
 def _parse_price(raw: str) -> Optional[float]:
-    """
-    Handle both French and English price formats:
-      French : 1 308 251,98 €  (space=thousands, comma=decimal)
-              "1 308 252 €"    (space=thousands, no decimal)
-      English: 714,725         (comma=thousands)
-               489,000
-    
-    Key rule: if a comma is followed by exactly 2 digits at the end → decimal.
-    Otherwise comma is a thousands separator and gets stripped.
-    """
     s = (raw or "").replace("\u202f","").replace("\xa0","").replace(" ","")
-    # Remove currency symbols and trailing noise
     s = re.sub(r"[€$£\s]", "", s)
     if not s:
         return None
-
-    # French decimal: comma followed by exactly 1-2 digits at end of number
-    # e.g. "1308251,98" → 1308251.98
     if re.search(r",\d{1,2}$", s):
         s = s.replace(",", ".")
     else:
-        # English thousands or no decimal — just strip commas
         s = s.replace(",", "")
-
     m = re.search(r"\d+(?:\.\d+)?", s)
     try:    return float(m.group()) if m else None
     except: return None
 
 def _parse_bool(raw: str) -> Optional[int]:
-    """Store booleans as 0/1/None for SQLite."""
     v = (raw or "").lower().strip()
     if v in ("yes","oui","ja","true","1","✓"):  return 1
     if v in ("no","non","nein","false","0"):     return 0
@@ -397,39 +382,16 @@ def _extract_phone(text: str) -> Optional[str]:
     return None
 
 def _parse_characteristics(soup: BeautifulSoup) -> Dict:
-    """
-    athome.lu renders the Caractéristiques block as flat concatenated text:
-
-        Prix de vente1 308 251,98 €
-        Surface habitable111,24 m²
-        Nombre de chambres3
-        Chauffage au gazOui
-
-    The label and value are consecutive text nodes (or inline spans) inside
-    the same parent element — there is NO sibling tag between them.
-
-    Strategy:
-      1. Isolate the ## Caractéristiques section of the page.
-      2. Build a flat list of (parent_element, full_text) pairs.
-      3. For each CHAR_MAP entry, search for a parent whose text STARTS WITH
-         a known label and extract everything after the label as the value.
-      4. Fallback: scan the entire soup the same way (for edge cases where
-         the section heading has a different name).
-    """
-    # ── Strip all script/style noise first ───────────────────
     for tag in soup.find_all(["script", "style"]):
         tag.decompose()
 
     result: Dict = {}
 
-    # ── Isolate the Caractéristiques section ─────────────────
-    # Find the ## Caractéristiques / ## Characteristics heading
     char_section_start = soup.find(
         lambda t: t.name in ("h2","h3","h4") and
                   re.search(r"caract[eé]ristiques|characteristics|eigenschaften",
                              t.get_text(), re.I)
     )
-    # Find where the section ends (next h2 at same level)
     char_section_end = None
     if char_section_start:
         for sib in char_section_start.find_next_siblings():
@@ -437,12 +399,8 @@ def _parse_characteristics(soup: BeautifulSoup) -> Dict:
                 char_section_end = sib
                 break
 
-    # Collect all leaf-ish elements inside the section
-    # We want elements whose direct text (not children) carries the label+value
     def _section_elements():
-        """Yield elements that are inside the Caractéristiques block."""
         if not char_section_start:
-            # Fallback: whole page
             yield from soup.find_all(True)
             return
         in_section = False
@@ -455,7 +413,6 @@ def _parse_characteristics(soup: BeautifulSoup) -> Dict:
             if in_section:
                 yield el
 
-    # Build a de-duplicated list of (element, cleaned_text) for matching
     seen_ids: set = set()
     elements: List[Tuple[Tag, str]] = []
     for el in _section_elements():
@@ -463,8 +420,6 @@ def _parse_characteristics(soup: BeautifulSoup) -> Dict:
         if eid in seen_ids:
             continue
         seen_ids.add(eid)
-        # Only leaf-ish elements (not containers holding many children)
-        # Heuristic: if the element has > 4 direct-child tags, skip it
         direct_tags = [c for c in el.children if hasattr(c, 'name') and c.name]
         if len(direct_tags) > 4:
             continue
@@ -474,35 +429,26 @@ def _parse_characteristics(soup: BeautifulSoup) -> Dict:
         elements.append((el, txt))
 
     def _extract_value(el_text: str, label: str) -> str:
-        """
-        Given the full text of an element and the label string,
-        return everything after the label (stripped).
-        e.g. "Prix de vente1 308 251,98 €"  label="Prix de vente"  → "1 308 251,98 €"
-        """
         pat = re.compile(re.escape(label) + r"\s*:?\s*", re.I)
         m   = pat.search(el_text)
         if m:
             return el_text[m.end():].strip()
         return ""
 
-    # ── Match each CHAR_MAP field ─────────────────────────────
     for field, labels, vtype in CHAR_MAP:
         if field in result:
-            continue  # already found
+            continue
         for label in labels:
-            # First pass: strict — element text starts with (or equals) the label
             for el, txt in elements:
                 if re.match(re.escape(label) + r"\s*:?\s*", txt, re.I):
                     raw = _extract_value(txt, label)
                     if not raw:
-                        # Value might be in the very next sibling element
                         nxt = el.find_next_sibling()
                         if nxt:
                             raw = _clean(nxt.get_text(" "))
                     if raw:
                         break
             else:
-                # Second pass: looser — label appears anywhere in the text
                 raw = ""
                 for el, txt in elements:
                     if re.search(re.escape(label), txt, re.I):
@@ -517,18 +463,17 @@ def _parse_characteristics(soup: BeautifulSoup) -> Dict:
             if not raw:
                 continue
 
-            # Sanity check: value must not look like JS or another label
             if len(raw) > 200 or "window." in raw or "{" in raw:
                 continue
 
             if   vtype == "price":      result[field] = _parse_price(raw)
             elif vtype == "int":        result[field] = _parse_int(raw)
             elif vtype == "float":      result[field] = _parse_float(raw)
-            elif vtype == "float_area": result[field] = _parse_float(raw)  # e.g. "51,69 m²"
+            elif vtype == "float_area": result[field] = _parse_float(raw)
             elif vtype == "bool":       result[field] = _parse_bool(raw)
             elif vtype == "energy":     result[field] = _parse_energy(raw)
             else:                       result[field] = raw
-            break  # found this label, move to next field
+            break
 
     return result
 
@@ -577,7 +522,7 @@ def _dismiss_cookies(driver: "webdriver.Chrome") -> None:
             continue
 
 # ─────────────────────────────────────────────────────────────
-# Description expander  ("Voir tout" / "See all" / "Mehr anzeigen")
+# Description expander
 # ─────────────────────────────────────────────────────────────
 
 _EXPAND_BTN_TEXTS = [
@@ -586,8 +531,6 @@ _EXPAND_BTN_TEXTS = [
     "lire la suite", "show more", "tout afficher",
 ]
 
-# These are navigation/promo links that appear near the description but must
-# NEVER be clicked — clicking them navigates away from the listing page.
 _EXPAND_BTN_BLACKLIST = [
     "en savoir plus", "learn more", "mehr erfahren", "go for it",
     "j'y vais", "get in touch", "request a quote", "demander",
@@ -596,35 +539,22 @@ _EXPAND_BTN_BLACKLIST = [
 ]
 
 def _expand_description(driver: "webdriver.Chrome") -> None:
-    """
-    Click the 'Voir tout' / 'See all' button to expand a truncated description.
-
-    IMPORTANT: Only <button> elements are clicked (never <a> tags, which
-    navigate away). We also verify the element is positioned within the top
-    half of the page (description section), not in footers/promo blocks.
-    """
     page_height = driver.execute_script("return document.body.scrollHeight") or 2000
 
     def _is_safe_expand_el(el) -> bool:
-        """Return True only if this element looks like a real expand toggle."""
         try:
             tag = el.tag_name.lower()
-            # Never click <a> — it navigates. Only <button> or role=button.
             if tag == "a":
                 href = (el.get_attribute("href") or "").strip()
-                # Only allow <a> with no href or href="#" (pure JS toggle)
                 if href and href != "#" and not href.startswith("javascript"):
                     return False
             txt = (el.text or "").lower().strip()
             if not txt or len(txt) > 30:
                 return False
-            # Must match expand keywords
             if not any(kw in txt for kw in _EXPAND_BTN_TEXTS):
                 return False
-            # Must NOT match navigation/promo blacklist
             if any(kw in txt for kw in _EXPAND_BTN_BLACKLIST):
                 return False
-            # Must be in the upper ~70% of page (description area)
             loc = el.location
             if loc.get("y", 0) > page_height * 0.70:
                 return False
@@ -632,7 +562,6 @@ def _expand_description(driver: "webdriver.Chrome") -> None:
         except Exception:
             return False
 
-    # Pass A: CSS selectors scoped to button tags only
     for sel in [
         "button[data-testid*='show-more']", "button[data-testid*='read-more']",
         "button[data-action*='expand']",     "button[class*='show-more']",
@@ -654,7 +583,6 @@ def _expand_description(driver: "webdriver.Chrome") -> None:
         except (NoSuchElementException, Exception):
             continue
 
-    # Pass B: scan only <button> elements by text
     try:
         for el in driver.find_elements(By.TAG_NAME, "button"):
             if _is_safe_expand_el(el):
@@ -668,7 +596,6 @@ def _expand_description(driver: "webdriver.Chrome") -> None:
                 return
     except Exception:
         pass
-    # Nothing clicked → description not truncated, or no expand button present
 
 
 def _read_tel_link(driver: "webdriver.Chrome") -> Optional[str]:
@@ -684,7 +611,6 @@ def _read_tel_link(driver: "webdriver.Chrome") -> Optional[str]:
     return _extract_phone(driver.page_source)
 
 def _click_phone_button(driver: "webdriver.Chrome") -> Optional[str]:
-    # Pass A: CSS selectors
     for sel in [
         "a[href^='tel:']","[data-testid*='phone']","[data-action*='phone']",
         "[aria-label*='numéro' i]","[aria-label*='number' i]",
@@ -704,7 +630,6 @@ def _click_phone_button(driver: "webdriver.Chrome") -> Optional[str]:
             if ph: return ph
         except (NoSuchElementException, Exception):
             continue
-    # Pass B: text scan
     for tag in ("button","a","span","div"):
         try:
             for el in driver.find_elements(By.TAG_NAME, tag):
@@ -756,10 +681,6 @@ def get_index_refs(
     index_url: str,
     max_pages: int = 2,
 ) -> List[Tuple[str, str]]:
-    """
-    Returns list of (listing_ref, listing_url) tuples, newest-first,
-    collected from up to `max_pages` pages of the index.
-    """
     results: List[Tuple[str, str]] = []
     current = index_url
     wait    = WebDriverWait(driver, 20)
@@ -819,29 +740,21 @@ def scrape_detail(
     driver.get(url)
     time.sleep(0.5)
     _dismiss_cookies(driver)
-    
-    # Wait for h1 title to load (React app takes time to render)
-    # Use try-except with fallback to avoid ChromeDriver crashes
-    h1_loaded = False
+
     try:
-        wait = WebDriverWait(driver, 5)  # Reduced to 5s to fail faster
+        wait = WebDriverWait(driver, 5)
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "h1")))
-        h1_loaded = True
         log.debug(f"  h1 loaded for {url}")
     except TimeoutException:
-        # h1 didn't load in time, but might still be in page - continue anyway
         log.debug(f"  h1 wait timeout for {url}, continuing anyway")
     except Exception as e:
-        # ChromeDriver crash or other issue - use simple sleep fallback
         log.warning(f"  h1 wait failed ({type(e).__name__}), using sleep fallback")
-        time.sleep(2)  # Give page more time to render
-    
-    # Always re-parse the page source (whether h1 loaded or not)
+        time.sleep(2)
+
     soup = BeautifulSoup(driver.page_source, "lxml")
-    
-    # ── Source (athome vs immotop) ──────────────────────────
+
     source = "athome" if "athome.lu" in url else "immotop" if "immotop.lu" in url else "unknown"
-    
+
     data: Dict = {
         "listing_url":      url,
         "source":           source,
@@ -850,12 +763,10 @@ def scrape_detail(
         "phone_source":     None,
     }
 
-    # ── Listing ref — three sources (URL is most reliable) ──
     ref_from_url = re.search(r"/id-(\d+)", url)
     if ref_from_url:
         data["listing_ref"] = ref_from_url.group(1)
 
-    # "Réf atHome 8983182" in the page body (confirms the URL ref)
     page_ref = soup.find(string=re.compile(
         r"R[ée]f\.?\s+(?:atHome|athome)?\s*:?\s*(\d{5,})", re.I
     ))
@@ -864,7 +775,6 @@ def scrape_detail(
         if m and not data.get("listing_ref"):
             data["listing_ref"] = m.group(1)
 
-    # "Réf Agence …"
     agency_ref_node = soup.find(string=re.compile(
         r"R[ée]f\.?\s+[Aa]gence|[Aa]gency\s+[Rr]ef", re.I
     ))
@@ -875,40 +785,29 @@ def scrape_detail(
             if nxt:
                 data["agency_ref"] = _clean(nxt.get_text())
 
-    # ── Expand truncated description ("Voir tout" / "See all" / "Mehr anzeigen")
     _expand_description(driver)
-    # Re-parse after potential expansion
     soup = BeautifulSoup(driver.page_source, "lxml")
 
-    # ── Title ────────────────────────────────────────────────
     h1 = soup.find("h1")
     if h1:
         data["title"] = _clean(h1.get_text())
     else:
-        # Fallback 1: Try page title (often contains listing title)
         page_title = soup.find("title")
         if page_title:
             title_text = _clean(page_title.get_text())
-            # athome format: "Acheter Immeuble de rapport 221 m² – 950 000 € |Ettelbruck"
-            # Extract the meaningful part (before the pipe or dash)
             title_parts = re.split(r'\s*[|–]\s*', title_text)
             if title_parts:
-                # Remove "Acheter" / "Louer" prefix
                 clean_title = re.sub(r'^(Acheter|Louer|Buy|Rent|Vente|Location)\s+', '', title_parts[0], flags=re.I)
                 data["title"] = _clean(clean_title)
                 log.debug(f"  Title from <title> tag: {data['title']}")
-        
-        # Fallback 2: Try og:title meta tag
         if not data.get("title"):
             og_title = soup.find("meta", property="og:title")
             if og_title and og_title.get("content"):
                 data["title"] = _clean(og_title["content"])
                 log.debug(f"  Title from og:title: {data['title']}")
-        
         if not data.get("title"):
             log.warning(f"  No title found for {url}")
 
-    # ── Location (last meaningful breadcrumb) ────────────────
     skip = {"accueil","acheter","louer","vente","location","home","buy","rent",
             "sell","appartement","maison","apartment","house",
             "en savoir plus","learn more","mehr erfahren","voir plus",
@@ -920,26 +819,17 @@ def scrape_detail(
         txt = _clean(crumb.get_text())
         if txt and txt.lower() not in skip and len(txt) > 2 \
                 and not re.match(r"R[ée]f", txt):
-            # Additional check: must not be a promotional link text
-            # Real locations: "Luxembourg-Gare", "Schuttrange", "Bonnevoie"
-            # Spam: "En savoir plus", "J'y vais", "Demander"
             if any(kw in txt.lower() for kw in ["savoir","learn","mehr","voir","see","read","lire","demander","request","j'y vais","go for"]):
                 continue
             data["location"] = txt
             location_found = True
             break
-    
-    # Fallback: extract from the <h1> title if breadcrumb failed
-    # e.g. "Appartement 3 chambres à Schuttrange" → "Schuttrange"
+
     if not location_found and data.get("title"):
         m = re.search(r"(?:à|in|in)\s+([A-Z][a-zé\-]+(?:\-[A-Z][a-zé\-]+)*)", data["title"])
         if m:
             data["location"] = m.group(1)
 
-    # ── Description ──────────────────────────────────────────
-    # Strategy: find the ## Description heading, collect all sibling text
-    # until we hit "Demander plus d'infos" / "Réf atHome" / next <h2>.
-    # Always strip <script> and <style> tags before reading text.
     desc_h = soup.find(
         lambda t: t.name in ("h2","h3","h4") and
                   re.search(r"^description$|^beschreibung$", t.get_text().strip(), re.I)
@@ -947,10 +837,8 @@ def scrape_detail(
     if desc_h:
         parts = []
         for sib in desc_h.find_next_siblings():
-            # Stop at the next section heading
             if sib.name in ("h2","h3","h4"):
                 break
-            # Stop at "Demander plus d'infos" / refs / ask-for-info blocks
             sib_txt = sib.get_text(" ", strip=True)
             if re.search(
                 r"demander plus d.infos|ask for more|mehr informationen|"
@@ -958,7 +846,6 @@ def scrape_detail(
                 sib_txt, re.I
             ):
                 break
-            # Remove script / style noise before extracting text
             for tag in sib.find_all(["script","style"]):
                 tag.decompose()
             txt = sib.get_text("\n", strip=True)
@@ -966,16 +853,15 @@ def scrape_detail(
                 parts.append(txt)
         if parts:
             data["description"] = _clean("\n".join(parts))
-    
-    # Fallback: largest text block that isn't in nav/header/footer/script
+
     if not data.get("description"):
         for tag in soup.find_all(["script","style"]):
             tag.decompose()
         candidates = [
             t for t in soup.find_all(["p","div"])
-            if 120 < len(t.get_text()) < 8000  # cap at 8k to avoid JS blobs
+            if 120 < len(t.get_text()) < 8000
             and not any(p.name in ("nav","header","footer") for p in t.parents)
-            and "window." not in t.get_text()   # hard exclude JS globals
+            and "window." not in t.get_text()
             and "AT_HOME_APP" not in t.get_text()
         ]
         if candidates:
@@ -984,17 +870,18 @@ def scrape_detail(
             )
 
     # ── Pass 1: phone from description ───────────────────────
+    # Validated with clean_phone() — if garbage, stays None so Pass 2 fires.
     if data.get("description"):
         ph = _extract_phone(data["description"])
         if ph:
-            data["phone_number"] = ph
-            data["phone_source"] = "description"
+            ph = clean_phone(ph, hint="LU")
+            if ph:
+                data["phone_number"] = ph
+                data["phone_source"] = "description"
 
-    # ── All characteristics ───────────────────────────────────
     data.update(_parse_characteristics(soup))
 
-    # ── Agency block ─────────────────────────────────────────
-    # Strategy 1: Find the "Annonce publiée par" / "Listing published by" section
+    # Agency block
     agency_section = soup.find(
         lambda t: t.name in ("section","div","aside")
                   and re.search(
@@ -1002,43 +889,35 @@ def scrape_detail(
                       t.get_text() or "", re.I
                   )
     )
-    
+
     if agency_section:
-        # Try link to agency profile page
         a_link = agency_section.find("a", href=re.compile(r"/agence|/realestate-agency|/immobilier"))
         if a_link:
             data["agency_name"] = _clean(a_link.get_text())
             href = a_link["href"]
             data["agency_url"] = href if href.startswith("http") else BASE_URL + href
-        
-        # If no link found, try bold/strong text (often the agency name)
+
         if not data.get("agency_name"):
             for tag in agency_section.find_all(["strong","b","h3","h4"]):
                 txt = _clean(tag.get_text())
                 if txt and len(txt) > 3 and len(txt) < 100:
-                    # Exclude generic labels
                     if not re.search(r"published|publiée|contact|annonce|listing|téléphone|phone", txt, re.I):
                         data["agency_name"] = txt
                         break
-        
-        # Logo
+
         logo = agency_section.find("img")
         if logo:
             src = logo.get("src","")
             data["agency_logo_url"] = src if src.startswith("http") else BASE_URL + src
-        
-        # Agent name (often in img alt text or a caption)
+
         for img in agency_section.find_all("img")[1:]:
             alt = (img.get("alt") or "").strip()
             if alt and len(alt) > 3 and len(alt) < 60:
-                # Likely a person's name
-                if re.search(r"[A-Z][a-z]+\s+[A-Z]", alt):  # "Mathieu SCHERRER"
+                if re.search(r"[A-Z][a-z]+\s+[A-Z]", alt):
                     data["agent_name"] = alt
                     break
-    
-    # Strategy 2: Fallback — scan whole page for agency metadata or schema.org
+
     if not data.get("agency_name"):
-        # Try schema.org structured data
         for script in soup.find_all("script", type="application/ld+json"):
             try:
                 ld = json.loads(script.string or "{}")
@@ -1053,8 +932,7 @@ def scrape_detail(
                         break
             except (json.JSONDecodeError, Exception):
                 continue
-    
-    # Strategy 3: Look for agency name near a logo image with recognizable agency URL
+
     if not data.get("agency_name"):
         for img in soup.find_all("img"):
             src = img.get("src", "")
@@ -1062,13 +940,12 @@ def scrape_detail(
                 parent = img.find_parent()
                 if parent:
                     txt = _clean(parent.get_text())
-                    # Extract first capitalized phrase (likely agency name)
                     m = re.search(r"([A-Z][A-Z\s&]+(?:SARL|SA|SPRL|IMMOBILIER|IMMO|REAL ESTATE)?)", txt)
                     if m and len(m.group(1)) < 60:
                         data["agency_name"] = m.group(1).strip()
                         break
 
-    # ── Images ───────────────────────────────────────────────
+    # Images
     image_urls: List[str] = []
     for img in soup.find_all("img"):
         for attr in ("src","data-src","data-lazy-src","data-original"):
@@ -1079,13 +956,15 @@ def scrape_detail(
     data["image_urls"] = json.dumps(image_urls)
 
     # ── Pass 2: phone from reveal button ─────────────────────
+    # Only runs if Pass 1 found nothing valid.
     if not data["phone_number"]:
         ph = _click_phone_button(driver)
         if ph:
-            data["phone_number"] = ph
-            data["phone_source"] = "button"
+            ph = clean_phone(ph, hint="LU")
+            if ph:
+                data["phone_number"] = ph
+                data["phone_source"] = "button"
 
-    # ── Download images ───────────────────────────────────────
     if save_images and image_urls and data.get("listing_ref"):
         folder = _download_images(image_urls, data["listing_ref"])
         data["images_dir"] = str(folder)
@@ -1107,18 +986,9 @@ def run(
     index_configs:       List[Dict],
     max_pages_per_index: int   = 2,
     save_images:         bool  = True,
-    delay_seconds:       float = 0,      # ← no delay
+    delay_seconds:       float = 0,
     headless:            bool  = True,
 ) -> Dict[str, int]:
-    """
-    For each index URL:
-      - Collect (ref, url) pairs newest-first.
-      - For each pair:
-          • NEW ref       → scrape fully, insert into DB.
-          • KNOWN ref, title CHANGED → re-scrape, update DB, keep history.
-          • KNOWN ref, title UNCHANGED → STOP (we've caught up).
-    Returns counters dict.
-    """
     db_init()
     if not SELENIUM_OK:
         log.error("Selenium not installed. Run: pip install selenium")
@@ -1141,7 +1011,6 @@ def run(
                 existing = db_get(ref)
 
                 if existing is None:
-                    # ── Brand new listing ─────────────────────────────
                     log.info(f"[{i}] NEW  {ref}  {lurl}")
                     d = scrape_detail(driver, lurl, t_type, save_images=save_images)
                     if d:
@@ -1150,9 +1019,6 @@ def run(
                     time.sleep(delay_seconds)
 
                 else:
-                    # ── Known ref — check title via lightweight fetch ──
-                    # We only fetch the detail page if the title changed;
-                    # to get the title cheaply we use requests (no Selenium cost)
                     try:
                         resp = requests.get(
                             lurl, headers={"User-Agent": USER_AGENT}, timeout=10
@@ -1166,7 +1032,6 @@ def run(
                     old_title = existing.get("title", "")
 
                     if current_title and current_title != old_title:
-                        # Title changed → full re-scrape + update
                         log.info(
                             f"[{i}] UPDATED  {ref}\n"
                             f"      old: {old_title}\n"
@@ -1178,13 +1043,12 @@ def run(
                             counters["updated"] += 1
                         time.sleep(delay_seconds)
                     else:
-                        # Unchanged known listing → stop early for this index
                         log.info(
                             f"[{i}] STOP — hit known listing {ref} (unchanged). "
                             f"All newer listings have been processed."
                         )
                         counters["stopped_early"] += 1
-                        break   # ← early exit for this index_url
+                        break
 
     finally:
         driver.quit()
@@ -1206,23 +1070,20 @@ def run(
 
 if __name__ == "__main__":
     INDEX_URLS = [
-        # athome.lu
         {"url": "https://www.athome.lu/vente?sort=date_desc",    "type": "buy"},
         {"url": "https://www.athome.lu/location?sort=date_desc", "type": "rent"},
-        # immotop.lu (add these when ready to scrape both sites)
         # {"url": "https://www.immotop.lu/vente/?sort=date_desc",    "type": "buy"},
         # {"url": "https://www.immotop.lu/location/?sort=date_desc", "type": "rent"},
     ]
 
     run(
         index_configs        = INDEX_URLS,
-        max_pages_per_index  = 2,      # 2 pages × ~20 listings = ~40 per run
+        max_pages_per_index  = 2,
         save_images          = True,
-        delay_seconds        = 0,      # ← no delay
-        headless             = True,   # False = watch the browser
+        delay_seconds        = 0,
+        headless             = True,
     )
 
-    # Pretty-print DB stats
     s = db_stats()
     print(f"\n{'─'*45}")
     print(f" DB: {DB_PATH}")
