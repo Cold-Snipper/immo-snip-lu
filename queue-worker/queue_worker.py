@@ -19,7 +19,7 @@ import os
 import signal
 import sys
 from datetime import datetime, timezone
-
+from typing import Dict, List, Optional
 import redis.asyncio as aioredis
 from bson import ObjectId
 from dotenv import load_dotenv
